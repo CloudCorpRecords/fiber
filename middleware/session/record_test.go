@@ -300,6 +300,30 @@ func Fuzz_Record_Parse(f *testing.F) {
 	})
 }
 
+// An entry has no capacity beyond its length: a codec that keeps a slice of the
+// record and appends to it cannot overwrite the entry that follows.
+func Test_Record_EntriesHaveNoSpareCapacity(t *testing.T) {
+	t.Parallel()
+
+	encoded := mustAppendRecord(t, "json", recordDeadline{}, []recordEntry{
+		{key: "a", value: []byte("one")}, {key: "b", value: []byte("two")}, {key: "c", value: []byte("three")},
+	})
+	original := slices.Clone(encoded)
+
+	seen := 0
+	_, err := parseRecord(encoded, func(key, value []byte) {
+		seen++
+		require.Equal(t, len(key), cap(key))
+		require.Equal(t, len(value), cap(value))
+		// Appending is what is tested: it must copy, and leave the record alone.
+		_ = append(value, "overwrite"...)
+		_ = append(key, "overwrite"...)
+	})
+	require.NoError(t, err)
+	require.Equal(t, 3, seen)
+	require.Equal(t, original, encoded)
+}
+
 // Parsing a record takes no memory, whatever the record claims to hold.
 func Test_Record_ParseAllocatesNothing(t *testing.T) {
 	// testing.AllocsPerRun panics in a parallel test, so this one stays sequential.
