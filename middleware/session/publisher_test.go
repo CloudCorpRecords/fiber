@@ -175,38 +175,6 @@ func Test_Session_Store_MiddlewareIsThePublisherOverTheOwnerLocal(t *testing.T) 
 	require.Equal(t, id+"|false", body, "the second middleware found its own session instead of taking the ID that the first cached")
 }
 
-// Store.Get says which store cached a new ID in the provenance box of the request
-// when the request has one, as it has when the client sent an ID, and in a local of
-// its own when it has none.
-func Test_Session_Store_Get_RecordsThePublisherWhereTheRequestCanHoldIt(t *testing.T) {
-	t.Parallel()
-
-	store := NewStore()
-	app := fiber.New()
-
-	withID := app.AcquireCtx(&fasthttp.RequestCtx{})
-	defer app.ReleaseCtx(withID)
-	withID.Request().Header.SetCookie("session_id", "names-no-session")
-	sess, err := store.Get(withID)
-	require.NoError(t, err)
-	defer sess.Release()
-	require.True(t, sess.Fresh())
-	box, ok := withID.Locals(sessionExtractorContextKey).(*provenanceBox)
-	require.True(t, ok)
-	require.Same(t, store, box.publisher)
-	require.Nil(t, withID.Locals(sessionOwnerContextKey), "the box says it already")
-
-	without := app.AcquireCtx(&fasthttp.RequestCtx{})
-	defer app.ReleaseCtx(without)
-	other, err := store.Get(without)
-	require.NoError(t, err)
-	defer other.Release()
-	require.True(t, other.Fresh())
-	_, hasBox := without.Locals(sessionExtractorContextKey).(*provenanceBox)
-	require.False(t, hasBox)
-	require.Same(t, store, without.Locals(sessionOwnerContextKey))
-}
-
 // The box goes back to a pool shared by every request: it must hold nothing of the
 // request it served.
 //

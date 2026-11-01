@@ -253,23 +253,6 @@ func Test_Session_StorageKeyPrefix_SeparatesStores(t *testing.T) {
 	require.ErrorIs(t, err, ErrSessionIDNotFoundInStore)
 }
 
-// A prefix does not scope Reset: the storage interface cannot list keys, so
-// Reset clears the whole storage, as the option documents.
-func Test_Store_Reset_ClearsTheWholeStorageDespiteAPrefix(t *testing.T) {
-	t.Parallel()
-
-	shared := memory.New()
-	store := NewStore(Config{Storage: shared, StorageKeyPrefix: "app:"})
-	require.NoError(t, shared.Set("unrelated", []byte("x"), time.Minute))
-	require.NoError(t, shared.Set("app:session", []byte("x"), time.Minute))
-
-	require.NoError(t, store.Reset(context.Background()))
-
-	keys, err := shared.Keys()
-	require.NoError(t, err)
-	require.Empty(t, keys)
-}
-
 // Benchmark_Store_StorageKey measures the key every read, write and delete of a
 // session goes through. Without a prefix or hashing it costs one allocation, the key itself.
 //

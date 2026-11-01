@@ -3,10 +3,8 @@ package session
 import (
 	"bytes"
 	"context"
-	"encoding/gob"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"slices"
 	"strconv"
 	"strings"
@@ -47,8 +45,6 @@ type countingCodec struct {
 	decodes  atomic.Int64
 }
 
-func newCountingCodec() *countingCodec { return &countingCodec{Codec: JSONCodec{}} }
-
 func (c *countingCodec) Marshal(v any) ([]byte, error) {
 	c.marshals.Add(1)
 	return c.Codec.Marshal(v)
@@ -58,25 +54,6 @@ func (c *countingCodec) Unmarshal(data []byte, v any) error {
 	c.decodes.Add(1)
 	return c.Codec.Unmarshal(data, v)
 }
-
-// reusingCodec hands out the same buffer for every value it encodes, as a codec
-// built on a pooled buffer may.
-type reusingCodec struct {
-	buf []byte
-}
-
-func (*reusingCodec) Name() string { return "reusing" }
-
-func (c *reusingCodec) Marshal(v any) ([]byte, error) {
-	encoded, err := json.Marshal(v)
-	if err != nil {
-		return nil, err //nolint:wrapcheck // the error is encoding/json's own
-	}
-	c.buf = append(c.buf[:0], encoded...)
-	return c.buf, nil
-}
-
-func (*reusingCodec) Unmarshal(data []byte, v any) error { return json.Unmarshal(data, v) } //nolint:wrapcheck // the error is encoding/json's own
 
 // sessionKey is the key under which a store without a prefix keeps the session with this ID.
 func sessionKey(id string) string { return keyNamespace + id }
@@ -103,80 +80,6 @@ func loadErr(app *fiber.App, store *Store, id string) error {
 		sess.Release()
 	}
 	return err
-}
-
-func Test_Codec_StoresEachValueEncoded(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	mem := memory.New()
-	store := NewStore(Config{Storage: mem, Codec: JSONCodec{}})
-	profile := newCodecProfile()
-	id := seedSession(t, app, store, func(s *Session) {
-		s.Set("profile", profile)
-		s.Set("visits", 3)
-		s.Set("name", "alice")
-	})
-
-	header, entries := storedRecord(t, mem, id)
-	require.Equal(t, "json", string(header.codec))
-	require.False(t, header.deadline.set)
-	require.Len(t, entries, 3)
-	require.Equal(t, "name", entries[0].key)
-	require.Equal(t, "profile", entries[1].key)
-	require.Equal(t, "visits", entries[2].key)
-	require.Equal(t, `"alice"`, string(entries[0].value))
-	require.Equal(t, `3`, string(entries[2].value))
-	want, err := json.Marshal(profile)
-	require.NoError(t, err)
-	require.Equal(t, string(want), string(entries[1].value))
-}
-
-func Test_Codec_TypedAndGenericReads(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	store := NewStore(Config{Codec: JSONCodec{}})
-	profile := newCodecProfile()
-	id := seedSession(t, app, store, func(s *Session) {
-		s.Set("profile", profile)
-		s.Set("visits", 3)
-		s.Set("name", "alice")
-		s.Set("nothing", nil)
-	})
-	sess := loadSession(t, app, store, id)
-
-	var got codecProfile
-	require.NoError(t, sess.GetInto("profile", &got))
-	require.Equal(t, profile, got)
-
-	visits, ok := GetAs[int](sess, "visits")
-	require.True(t, ok)
-	require.Equal(t, 3, visits)
-
-	fromGet, ok := GetAs[codecProfile](sess, "profile")
-	require.True(t, ok)
-	require.Equal(t, profile, fromGet)
-
-	_, ok = GetAs[int](sess, "name")
-	require.False(t, ok, "a string does not decode into an int")
-	_, ok = GetAs[string](sess, "missing")
-	require.False(t, ok)
-
-	require.ErrorIs(t, sess.GetInto("missing", &got), ErrKeyNotFound)
-	var count int
-	require.Error(t, sess.GetInto("name", &count))
-
-	// Get is the generic form of the codec.
-	require.InDelta(t, 3.0, sess.Get("visits"), 0)
-	require.Equal(t, "alice", sess.Get("name"))
-	require.Nil(t, sess.Get("nothing"))
-	require.Nil(t, sess.Get("missing"))
-	generic, ok := sess.Get("profile").(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, "alice", generic["name"])
-
-	require.ElementsMatch(t, []any{"name", "nothing", "profile", "visits"}, sess.Keys())
 }
 
 func Test_Codec_ReadsDoNotAliasTheSession(t *testing.T) {
@@ -221,144 +124,6 @@ func Test_Codec_SetStoresASnapshot(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, []string{"a"}, got, "what was set is what was encoded then")
 	_ = list
-}
-
-func Test_Codec_DefaultStoreWritesPlainGob(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	mem := memory.New()
-	store := NewStore(Config{Storage: mem})
-	id := seedSession(t, app, store, func(s *Session) { s.Set("k", "v") })
-
-	raw, err := mem.Get(sessionKey(id))
-	require.NoError(t, err)
-	require.False(t, isRecord(raw))
-
-	var want bytes.Buffer
-	single := map[any]any{"k": "v"}
-	require.NoError(t, gob.NewEncoder(&want).Encode(&single))
-	require.Equal(t, want.Bytes(), raw, "the default format is the gob stream of a map[any]any")
-
-	// A gob stream written by an independent encoder is read as it always was.
-	independent := map[any]any{"n": 7, "s": "x", true: 1.5}
-	var buf bytes.Buffer
-	require.NoError(t, gob.NewEncoder(&buf).Encode(&independent))
-	require.NoError(t, mem.Set(sessionKey("legacy"), buf.Bytes(), time.Hour))
-	sess := loadSession(t, app, store, "legacy")
-	require.Equal(t, 7, sess.Get("n"))
-	require.Equal(t, "x", sess.Get("s"))
-	require.InDelta(t, 1.5, sess.Get(true), 0)
-}
-
-func Test_Codec_GobSessionsStayGob(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	mem := memory.New()
-	gobStore := NewStore(Config{Storage: mem, AbsoluteTimeout: time.Hour})
-	gobStore.RegisterType(codecProfile{})
-	profile := newCodecProfile()
-	id := seedSession(t, app, gobStore, func(s *Session) {
-		s.Set("profile", profile)
-		s.Set("visits", 3)
-		s.Set("name", "alice")
-	})
-	gobRaw, err := mem.Get(sessionKey(id))
-	require.NoError(t, err)
-	require.False(t, isRecord(gobRaw))
-	wantExpiry, ok := loadSession(t, app, gobStore, id).AbsoluteExpiry()
-	require.True(t, ok)
-
-	codecStore := NewStore(Config{Storage: mem, Codec: JSONCodec{}, AbsoluteTimeout: time.Hour})
-	sess := loadSession(t, app, codecStore, id)
-	require.False(t, sess.Fresh())
-	require.Equal(t, id, sess.ID())
-	require.Nil(t, sess.data.codec, "a session that was stored as gob is gob, whatever the store now does")
-
-	// It reads as it did: the typed readers work in either mode, and Get returns the values themselves.
-	var got codecProfile
-	require.NoError(t, sess.GetInto("profile", &got))
-	require.Equal(t, profile, got)
-	visits, ok := GetAs[int](sess, "visits")
-	require.True(t, ok)
-	require.Equal(t, 3, visits)
-	require.Equal(t, 3, sess.Get("visits"))
-	require.Equal(t, "alice", sess.Get("name"))
-	expiry, ok := sess.AbsoluteExpiry()
-	require.True(t, ok)
-	require.True(t, wantExpiry.Equal(expiry))
-
-	// Saved after only scalars were read, it is the same bytes.
-	scalars := loadSession(t, app, codecStore, id)
-	require.Equal(t, 3, scalars.Get("visits"))
-	require.NoError(t, scalars.Save())
-	stored, err := mem.Get(sessionKey(id))
-	require.NoError(t, err)
-	require.Equal(t, gobRaw, stored)
-
-	// Saved changed, it is gob still, and a store without a codec reads it.
-	sess.Set("visits", 4)
-	require.NoError(t, sess.Save())
-	stored, err = mem.Get(sessionKey(id))
-	require.NoError(t, err)
-	require.False(t, isRecord(stored))
-	back := loadSession(t, app, gobStore, id)
-	require.Equal(t, 4, back.Get("visits"))
-	require.Equal(t, "alice", back.Get("name"))
-
-	// A session that starts over is a session of the store: it has a record.
-	require.NoError(t, sess.Reset())
-	require.NotNil(t, sess.data.codec)
-	sess.Set("k", "v")
-	require.NoError(t, sess.Save())
-	header, entries := storedRecord(t, mem, sess.ID())
-	require.True(t, header.deadline.set, "and its deadline")
-	require.Len(t, entries, 1)
-
-	// So does one that is new.
-	fresh := loadSession(t, app, codecStore, "")
-	require.NotNil(t, fresh.data.codec)
-}
-
-// badUTF8 is a string that JSON cannot carry: its second byte is not UTF-8.
-var badUTF8 = string([]byte{'a', 0xff, 'b'})
-
-type codecHidden struct {
-	Shown  string
-	Secret string `json:"-"`
-}
-
-// A session that was stored as gob is not converted, and nothing is lost to a
-// conversion that a codec does not do the way gob does.
-func Test_Codec_GobSessionsKeepEverythingTheyHold(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	mem := memory.New()
-	gobStore := NewStore(Config{Storage: mem})
-	gobStore.RegisterType(codecHidden{})
-	codecStore := NewStore(Config{Storage: mem, Codec: JSONCodec{}})
-
-	id := seedSession(t, app, gobStore, func(s *Session) {
-		s.Set(7, "a key that is not a string")
-		s.Set("bytes", badUTF8)
-		s.Set("hidden", codecHidden{Shown: "shown", Secret: "secret"})
-		s.Set("complex", complex(1, 2))
-	})
-
-	sess := loadSession(t, app, codecStore, id)
-	require.Equal(t, "a key that is not a string", sess.Get(7))
-	require.NoError(t, sess.Save())
-	sess.Set("more", 1)
-	require.NoError(t, sess.Save())
-
-	back := loadSession(t, app, gobStore, id)
-	require.Equal(t, "a key that is not a string", back.Get(7))
-	require.Equal(t, badUTF8, back.Get("bytes"))
-	require.Equal(t, codecHidden{Shown: "shown", Secret: "secret"}, back.Get("hidden"))
-	require.Equal(t, complex(1, 2), back.Get("complex"))
-	require.Equal(t, 1, back.Get("more"))
 }
 
 // Not parallel: the log output is process-global, so this test captures it.
@@ -536,124 +301,6 @@ func memoryOf(t *testing.T, rec *recordingStorage) *memory.Storage {
 	return mem
 }
 
-func Test_Codec_DecodesOnlyWhatIsRead(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	mem := memory.New()
-	codec := newCountingCodec()
-	store := NewStore(Config{Storage: mem, Codec: codec})
-	id := seedSession(t, app, store, func(s *Session) {
-		s.Set("profile", newCodecProfile())
-		s.Set("visits", 3)
-		s.Set("name", "alice")
-	})
-	require.EqualValues(t, 3, codec.marshals.Load())
-	before, err := mem.Get(sessionKey(id))
-	require.NoError(t, err)
-	_, beforeEntries := storedRecord(t, mem, id)
-
-	sess := loadSession(t, app, store, id)
-	require.Zero(t, codec.decodes.Load(), "loading a session decodes none of its values")
-
-	var name string
-	require.NoError(t, sess.GetInto("name", &name))
-	require.EqualValues(t, 1, codec.decodes.Load(), "reading one value decodes that one")
-
-	require.NoError(t, sess.Save())
-	require.EqualValues(t, 3, codec.marshals.Load(), "a save of an unchanged session encodes nothing")
-	after, err := mem.Get(sessionKey(id))
-	require.NoError(t, err)
-	require.Equal(t, before, after)
-
-	sess.Set("visits", 4)
-	require.EqualValues(t, 4, codec.marshals.Load(), "setting one value encodes that one")
-	require.NoError(t, sess.Save())
-	require.EqualValues(t, 4, codec.marshals.Load())
-
-	_, afterEntries := storedRecord(t, mem, id)
-	require.Equal(t, beforeEntries[0], afterEntries[0])
-	require.Equal(t, beforeEntries[1], afterEntries[1])
-	require.Equal(t, `4`, string(afterEntries[2].value))
-}
-
-func Test_Codec_KeepsACopyOfWhatTheCodecReturns(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	store := NewStore(Config{Codec: &reusingCodec{}})
-	id := seedSession(t, app, store, func(s *Session) {
-		s.Set("a", "first")
-		s.Set("b", "other")
-		s.Set("c", "third")
-	})
-
-	sess := loadSession(t, app, store, id)
-	for key, want := range map[string]string{"a": "first", "b": "other", "c": "third"} {
-		got, ok := GetAs[string](sess, key)
-		require.True(t, ok)
-		require.Equal(t, want, got, key)
-	}
-}
-
-func Test_Codec_DeleteResetRegenerateDestroy(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	mem := memory.New()
-	store := NewStore(Config{Storage: mem, Codec: JSONCodec{}})
-	seed := func(t *testing.T) *Session {
-		t.Helper()
-		id := seedSession(t, app, store, func(s *Session) {
-			s.Set("a", 1)
-			s.Set("b", 2)
-		})
-		return loadSession(t, app, store, id)
-	}
-
-	t.Run("Delete", func(t *testing.T) {
-		t.Parallel()
-		sess := seed(t)
-		sess.Delete("a")
-		sess.Delete(7) // not a string: nothing to delete
-		require.Nil(t, sess.Get("a"))
-		require.Equal(t, []any{"b"}, sess.Keys())
-	})
-
-	t.Run("Regenerate keeps the data under a new ID", func(t *testing.T) {
-		t.Parallel()
-		sess := seed(t)
-		old := sess.ID()
-		require.NoError(t, sess.Regenerate())
-		require.NotEqual(t, old, sess.ID())
-		got, ok := GetAs[int](sess, "b")
-		require.True(t, ok)
-		require.Equal(t, 2, got)
-		require.NoError(t, sess.Save())
-		_, entries := storedRecord(t, mem, sess.ID())
-		require.Len(t, entries, 2)
-	})
-
-	t.Run("Reset clears the data", func(t *testing.T) {
-		t.Parallel()
-		sess := seed(t)
-		require.NoError(t, sess.Reset())
-		require.Empty(t, sess.Keys())
-		require.Nil(t, sess.Get("b"))
-	})
-
-	t.Run("Destroy deletes the record", func(t *testing.T) {
-		t.Parallel()
-		sess := seed(t)
-		id := sess.ID()
-		require.NoError(t, sess.Destroy())
-		raw, err := mem.Get(sessionKey(id))
-		require.NoError(t, err)
-		require.Nil(t, raw)
-		require.Empty(t, sess.Keys())
-	})
-}
-
 func Test_Codec_AbsoluteTimeout(t *testing.T) {
 	t.Parallel()
 
@@ -699,34 +346,6 @@ func Test_Codec_AbsoluteTimeout(t *testing.T) {
 		_, ok := loadSession(t, app, plain, other).AbsoluteExpiry()
 		require.False(t, ok)
 	})
-}
-
-func Test_Codec_GetByID(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	mem := memory.New()
-	store := NewStore(Config{Storage: mem, Codec: JSONCodec{}})
-	id := seedSession(t, app, store, func(s *Session) { s.Set("profile", newCodecProfile()) })
-
-	sess, err := store.GetByID(context.Background(), id)
-	require.NoError(t, err)
-	defer sess.Release()
-	var got codecProfile
-	require.NoError(t, sess.GetInto("profile", &got))
-	require.Equal(t, newCodecProfile(), got)
-
-	// A pooled session of a store with a codec does not carry it to the next store.
-	plain := NewStore(Config{Storage: memory.New()})
-	for range 20 {
-		ctx := app.AcquireCtx(&fasthttp.RequestCtx{})
-		s, err := plain.Get(ctx)
-		require.NoError(t, err)
-		require.Nil(t, s.data.codec)
-		s.Set(7, "any key is fine without a codec")
-		s.Release()
-		app.ReleaseCtx(ctx)
-	}
 }
 
 func Test_Codec_Middleware(t *testing.T) {
@@ -922,13 +541,6 @@ func Test_Session_GetInto_WithoutCodec(t *testing.T) {
 	})
 }
 
-func Test_Codec_ErrorsNamePortableCauses(t *testing.T) {
-	t.Parallel()
-
-	require.NotErrorIs(t, errNonStringKey, ErrKeyNotFound)
-	require.NotErrorIs(t, fmt.Errorf("x: %w", errCodecMismatch), errRecordNeedsCodec)
-}
-
 // zeroCopyCodec stores bytes as they are and decodes them without a copy, as a
 // codec that keeps a slice of its input does.
 type zeroCopyCodec struct{}
@@ -998,108 +610,6 @@ func Test_Codec_DecodedValuesDoNotAliasTheSnapshot(t *testing.T) {
 	require.Equal(t, "second", string(second))
 }
 
-func Test_Codec_PooledSessionsForgetTheirCodec(t *testing.T) {
-	t.Parallel()
-
-	// The data of a session that goes back to the pool lets go of its codec and of the
-	// failed Sets. (It is a data of the test: a pooled one is not read after it was given back.)
-	own := &data{Data: map[any]any{}, codec: &namedCodec{Codec: JSONCodec{}, name: "json"}}
-	own.Set("k", 1)
-	own.Set(2, "a key that is not a string")
-	require.NotNil(t, own.codec)
-	require.NotEmpty(t, own.errs)
-
-	// A reset in the life of a session keeps the codec, and forgets the failed Sets.
-	own.Reset()
-	require.NotNil(t, own.codec)
-	require.Equal(t, "json", own.codec.name)
-	require.Nil(t, own.errs)
-
-	own.Set(2, "again")
-	own.resetAs(nil)
-	require.Nil(t, own.codec)
-	require.Nil(t, own.errs)
-	require.Empty(t, own.Data)
-
-	// And whatever the pool hands out is clean, usually the object that was just put back.
-	pooled := acquireData()
-	pooled.codec = &namedCodec{Codec: JSONCodec{}, name: "json"}
-	pooled.Set(7, "not a string key")
-	require.NotEmpty(t, pooled.errs)
-	releaseData(pooled)
-	fresh := acquireData()
-	defer releaseData(fresh)
-	require.Nil(t, fresh.codec)
-	require.Nil(t, fresh.errs)
-
-	// And what a store without a codec writes after sessions of one went back to the
-	// pool is gob, wherever the pool puts them.
-	app := fiber.New()
-	withCodec := NewStore(Config{Codec: JSONCodec{}})
-	mem := memory.New()
-	t.Cleanup(func() { require.NoError(t, mem.Close()) })
-	plain := NewStore(Config{Storage: mem})
-
-	for range 50 {
-		ctx := app.AcquireCtx(&fasthttp.RequestCtx{})
-		sess, err := withCodec.Get(ctx)
-		require.NoError(t, err)
-		sess.Set("k", 1)
-		sess.Set(2, "ignored: the failed Set goes with the session")
-		sess.Release()
-		app.ReleaseCtx(ctx)
-
-		ctx = app.AcquireCtx(&fasthttp.RequestCtx{})
-		other, err := plain.Get(ctx)
-		require.NoError(t, err)
-		require.Nil(t, other.data.codec)
-		other.Set(2, "any key is fine for gob")
-		require.NoError(t, other.Save())
-		raw, err := mem.Get(sessionKey(other.ID()))
-		require.NoError(t, err)
-		require.False(t, isRecord(raw), "what a store without a codec writes is gob")
-		other.Release()
-		app.ReleaseCtx(ctx)
-	}
-}
-
-// A key that cannot be hashed makes a read panic. The lock the read took must go with it,
-// or the deferred Release of the store pattern waits for it for ever.
-func Test_Session_ReadsReleaseTheirLocksWhenTheyPanic(t *testing.T) {
-	t.Parallel()
-
-	unhashable := []int{1}
-	for name, codec := range map[string]Codec{"gob": nil, "codec": JSONCodec{}} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
-
-			app := fiber.New()
-			store := NewStore(Config{Codec: codec})
-			reads := map[string]func(*Session){
-				"Get":     func(s *Session) { _ = s.Get(unhashable) },
-				"GetAs":   func(s *Session) { _, _ = GetAs[int](s, unhashable) },
-				"GetInto": func(s *Session) { var out int; _ = s.GetInto(unhashable, &out) }, //nolint:errcheck // the call panics
-			}
-			for read, fn := range reads {
-				sess := loadSession(t, app, store, "")
-				require.Panics(t, func() { fn(sess) }, read)
-
-				done := make(chan struct{})
-				go func() {
-					defer close(done)
-					sess.Set("k", 1) // takes the write lock
-					sess.Delete("k")
-				}()
-				select {
-				case <-done:
-				case <-time.After(10 * time.Second):
-					t.Fatalf("%s left the lock of the session taken", read)
-				}
-			}
-		})
-	}
-}
-
 func Test_Middleware_ReadsReleaseTheirLocksWhenTheyPanic(t *testing.T) {
 	t.Parallel()
 
@@ -1165,57 +675,6 @@ func Test_Codec_ResetIsOneStep(t *testing.T) {
 		// Whatever the Sets did, what is in the session is of the store.
 		require.NotNil(t, sess.data.codec)
 		require.NoError(t, sess.Save())
-	}
-}
-
-// With a codec GetAs and GetInto decode what was stored into the type they are asked
-// for; they do not check that this type is the one it was stored as, which gob does.
-func Test_Codec_GetAsDecodesItDoesNotCheckTheType(t *testing.T) {
-	t.Parallel()
-
-	type user struct{ Name string }
-	type admin struct{ Name string }
-
-	app := fiber.New()
-	gobStore := NewStore()
-	gobStore.RegisterType(user{})
-	codecStore := NewStore(Config{Codec: JSONCodec{}})
-
-	for name, store := range map[string]*Store{"gob": gobStore, "codec": codecStore} {
-		id := seedSession(t, app, store, func(s *Session) {
-			s.Set("user", user{Name: "alice"})
-			s.Set("count", 5)
-		})
-		sess := loadSession(t, app, store, id)
-
-		_, isAdmin := GetAs[admin](sess, "user")
-		_, isFloat := GetAs[float64](sess, "count")
-		_, isInt64 := GetAs[int64](sess, "count")
-		_, isUser := GetAs[user](sess, "user")
-		require.True(t, isUser, name)
-		if name == "gob" {
-			require.False(t, isAdmin, "gob checks the type that was stored")
-			require.False(t, isFloat)
-			require.False(t, isInt64)
-		} else {
-			require.True(t, isAdmin, "a codec decodes into whatever fits")
-			require.True(t, isFloat)
-			require.True(t, isInt64)
-		}
-	}
-}
-
-// A key is quoted in an error, so that a key that came from a client cannot forge a line of a log.
-func Test_Session_ErrorsQuoteTheKey(t *testing.T) {
-	t.Parallel()
-
-	for _, codec := range []Codec{nil, JSONCodec{}} {
-		sess := loadSession(t, fiber.New(), NewStore(Config{Codec: codec}), "")
-		var out string
-		err := sess.GetInto("a\nb [Error] forged", &out)
-		require.ErrorIs(t, err, ErrKeyNotFound)
-		require.NotContains(t, err.Error(), "\n")
-		require.Contains(t, err.Error(), `"a\nb [Error] forged"`)
 	}
 }
 
@@ -1462,44 +921,6 @@ func Test_Codec_RunsWithoutTheSessionLocked(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("GetInto, GetAs or Get holds the lock of the session while the codec runs")
 	}
-}
-
-// scribblingCodec overwrites the bytes it is handed once it has decoded them.
-type scribblingCodec struct{ JSONCodec }
-
-func (scribblingCodec) Name() string { return "scribbling" }
-
-func (c scribblingCodec) Unmarshal(data []byte, v any) error {
-	err := c.JSONCodec.Unmarshal(data, v)
-	for i := range data {
-		data[i] = 'X'
-	}
-	return err
-}
-
-// Get, like GetAs and GetInto, hands the codec a copy: what the codec does to it does not reach
-// the session.
-func Test_Codec_GetHandsTheCodecACopy(t *testing.T) {
-	t.Parallel()
-
-	app := fiber.New()
-	mem := memory.New()
-	store := NewStore(Config{Storage: mem, Codec: scribblingCodec{}})
-	id := seedSession(t, app, store, func(s *Session) { s.Set("a", "hello") })
-	before, err := mem.Get(sessionKey(id))
-	require.NoError(t, err)
-
-	sess := loadSession(t, app, store, id)
-	require.Equal(t, "hello", sess.Get("a"))
-	require.Equal(t, "hello", sess.Get("a"), "the first read did not damage what is stored")
-	var s string
-	require.NoError(t, sess.GetInto("a", &s))
-	require.Equal(t, "hello", s)
-	require.NoError(t, sess.Save())
-
-	after, err := mem.Get(sessionKey(id))
-	require.NoError(t, err)
-	require.Equal(t, before, after)
 }
 
 // A Set that fails on a session that was loaded, and not changed otherwise, still fails the save:

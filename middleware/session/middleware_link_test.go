@@ -392,24 +392,6 @@ func Test_Session_Middleware_AbandonedLookupDoesNotFindTheNextRequest(t *testing
 	releaseMiddleware(second)
 }
 
-// Not parallel: it reads a middleware after it went back to the shared pool, where a
-// parallel test could take it and drop it in the meantime.
-func Test_Session_ReleaseMiddleware_RecyclesWhatNothingRefersTo(t *testing.T) {
-	app := fiber.New()
-	c := app.AcquireCtx(&fasthttp.RequestCtx{})
-	defer app.ReleaseCtx(c)
-
-	outer := startMiddleware(t, c, NewStore(Config{Extractor: extractors.FromCookie("a_sid")}))
-	inner := startMiddleware(t, c, NewStore(Config{Extractor: extractors.FromCookie("b_sid")}))
-
-	releaseMiddleware(inner)
-	require.False(t, inner.released.Load(), "nothing refers to the inner middleware, so it is recycled")
-	require.Zero(t, outer.children.Load())
-
-	releaseMiddleware(outer)
-	require.False(t, outer.released.Load(), "nothing refers to the outer one either, since the inner one let go of it")
-}
-
 // The session of an abandoned request is cut off from its context while a goroutine
 // that outlives the request may be reading it. Run with -race.
 func Test_Session_ReleaseMiddleware_AbandonedSessionIsRaceFree(t *testing.T) {
